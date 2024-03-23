@@ -1,10 +1,10 @@
-use std::{collections::HashMap, net::SocketAddr, path::PathBuf};
+use std::path::PathBuf;
 
 use clap::{arg, command, value_parser};
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt},
-    net::UdpSocket
+    io::AsyncReadExt,
+    net::UdpSocket, time::timeout
 };
 use anyhow::Result;
 
@@ -12,7 +12,9 @@ use tftpd::{parse_message, ErrorCode, Message, Mode};
 
 const DEFAULT_PORT: &str = "69";
 const DEFAULT_STATIC_ROOT: &str = "/srv/tftp/static";
-const BLOCK_SIZE: u64 = 512;
+const BLOCK_SIZE: usize = 512;
+const MAX_ATTEMPTS: usize = 5;
+const DEFAULT_TIMEOUT: u64 = 3000; // milliseconds
 
 #[derive(Debug)]
 struct Config {
@@ -37,79 +39,6 @@ fn get_config() -> Result<Config> {
         port,
         static_root,
     })
-}
-
-struct TransferInfo {
-    file: File,
-    last_block: u16,
-}
-
-struct Tracker {
-    active: HashMap<SocketAddr, TransferInfo>,
-}
-
-impl Tracker {
-    fn new() -> Self {
-        Tracker {
-            active: HashMap::new()
-        }
-    }
-
-    fn add(&mut self, addr: SocketAddr, file: File) {
-        self.active.insert(addr, TransferInfo { file, last_block: 1 });
-    }
-
-    fn ack(&mut self, addr: &SocketAddr, block: u16) -> bool {
-        if let Some(info) = self.active.get_mut(addr) {
-            if info.last_block == block {
-                info.last_block = info.last_block + 1;
-                return true;
-            }
-        }
-
-        false
-    }
-
-    fn del(&mut self, addr: &SocketAddr) {
-        if let Some(value) = self.active.remove(addr) {
-            // This should be automatic, but let's be explicit about it
-            drop(value.file);
-        }
-    }
-
-    async fn read_block(&mut self, addr: &SocketAddr) -> Option<Message> {
-        if let Some(info) = self.active.get_mut(addr) {
-            let mut buffer = [0 as u8; BLOCK_SIZE as usize];
-            let offset = ((info.last_block - 1) as u64) * BLOCK_SIZE;
-            match info.file.seek(std::io::SeekFrom::Start(offset)).await {
-                Err(error) => {
-                    // TODO: This would have consequences...
-                    eprintln!("Error when seeking: {error:?}");
-                    return None;
-                }
-                _ => {}
-            };
-            let len = match info.file.read(&mut buffer).await {
-                Ok(len) => len,
-                Err(error) => {
-                    // TODO: This would have consequences...
-                    eprintln!("Error when reading: {error:?}");
-                    return None;
-                }
-            };
-
-            if len > 0 {
-                Some(Message::Data {
-                    block: info.last_block,
-                    payload: buffer[..len].into(),
-                })
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    }
 }
 
 async fn open_file(config: &Config, filename: &str) -> Result<File, Message> {
@@ -138,25 +67,72 @@ async fn open_file(config: &Config, filename: &str) -> Result<File, Message> {
     })
 }
 
-async fn send_block(tracker: &mut Tracker, sock: &UdpSocket, addr: SocketAddr) {
-    let packet = tracker.read_block(&addr).await
-        .and_then(|msg| Some(msg.into_packet()));
-// // TODO: None should be the case when there's nothing else to send...
-// //            Some(ErrorCode::NotDefined
-// //                 .into_message()
-// //                 .into_packet())
-//         .or_else(|| {
-//             tracker.del(&addr);
-//         }).unwrap();
-    if let Some(p) = packet {
-        sock.send_to(&p, addr.clone()).await;
+async fn read_block(file: &mut File, block_size: usize) -> Result<Vec<u8>> {
+    let mut buffer = vec![0; block_size];
+    let len = file.read(&mut buffer).await?;
+
+    Ok(buffer[..len].to_vec())
+}
+
+async fn worker_task(sock: UdpSocket, mut file: File) {
+    let block_size = BLOCK_SIZE;
+    let tout = tokio::time::Duration::from_millis(DEFAULT_TIMEOUT);
+
+    let mut current_block: u16 = 0;
+    let mut read_buffer = vec![0; block_size];
+    loop {
+        current_block += 1;
+        let payload = match read_block(&mut file, block_size).await {
+            Ok(data) => data,
+            Err(_) => {
+                sock.send(&ErrorCode::NotDefined.into_message().into_packet()).await;
+                break;
+            }
+        };
+        let payload_len = payload.len();
+
+        let message = Message::Data { block: current_block, payload }.into_packet();
+        let mut failed_attempts = 0;
+        let mut waiting_for_ack = false;
+        while failed_attempts < MAX_ATTEMPTS {
+            if !waiting_for_ack {
+                sock.send(&message).await;
+                waiting_for_ack = true;
+            } else if timeout(tout, sock.recv(&mut read_buffer)).await.is_ok() {
+                if let Ok(message) = parse_message(&read_buffer) {
+                    match message {
+                        Message::Ack(block_id) => {
+                            if block_id == current_block {
+                                break;
+                            }
+                        }
+                        _ => {
+                            sock.send(&ErrorCode::IllegalOperation
+                                      .into_message()
+                                      .into_packet()).await;
+                        }
+                    };
+                }
+            } else {
+                failed_attempts += 1;
+                eprintln!("Timeout (failed: {failed_attempts}/{MAX_ATTEMPTS})");
+                waiting_for_ack = false;
+            }
+        }
+
+        if failed_attempts >= MAX_ATTEMPTS {
+            return;
+        }
+
+        if payload_len < block_size {
+            break;
+        }
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = get_config()?;
-    let mut tracker = Tracker::new();
 
     let sock = UdpSocket::bind(("127.0.0.1", config.port)).await?;
 
@@ -176,7 +152,6 @@ async fn main() -> Result<()> {
                     }
                     Message::Read { filename, mode } => {
                         if mode != Mode::Octet {
-                            eprintln!("Not a supported mode...");
                             sock.send_to(
                                 &ErrorCode::IllegalOperation
                                     .into_explicit_message("Only Octet transfers are supported")
@@ -185,8 +160,11 @@ async fn main() -> Result<()> {
                         } else {
                             match open_file(&config, &filename).await {
                                 Ok(file) => {
-                                    tracker.add(addr.clone(), file);
-                                    send_block(&mut tracker, &sock, addr).await;
+                                    // TODO: We should look for errors here...
+                                    let sock = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+                                    sock.connect(addr).await.unwrap();
+
+                                    tokio::spawn(worker_task(sock, file));
                                 }
                                 Err(errmsg) => {
                                     sock.send_to(&errmsg.into_packet(), addr).await;
@@ -195,8 +173,6 @@ async fn main() -> Result<()> {
                         }
                     }
                     Message::Ack(block) => {
-                        tracker.ack(&addr, block);
-                        send_block(&mut tracker, &sock, addr).await;
                     }
                     _ => {}
                 }

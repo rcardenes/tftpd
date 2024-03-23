@@ -22,18 +22,6 @@ impl TryFrom<u16> for PacketType {
     }
 }
 
-impl Into<u16> for PacketType {
-    fn into(self) -> u16 {
-        match self {
-            PacketType::ReadRequest => 1,
-            PacketType::WriteRequest => 2,
-            PacketType::Data => 3,
-            PacketType::Acknowledgement => 4,
-            PacketType::Error => 5,
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Mode {
     NetAscii,
@@ -64,21 +52,6 @@ pub enum ErrorCode {
     UnknownTransferId,
     FileAlreadyExists,
     NoSuchUser,
-}
-
-impl Into<u16> for ErrorCode {
-    fn into(self) -> u16 {
-        match self {
-            ErrorCode::NotDefined => 1,
-            ErrorCode::FileNotFound => 2,
-            ErrorCode::AccessViolation => 3,
-            ErrorCode::DiskFull => 4,
-            ErrorCode::IllegalOperation => 5,
-            ErrorCode::UnknownTransferId => 6,
-            ErrorCode::FileAlreadyExists => 7,
-            ErrorCode::NoSuchUser => 8,
-        }
-    }
 }
 
 impl ErrorCode {
@@ -118,16 +91,16 @@ impl Message {
             // Message::Read { filename, mode } => todo!(),
             // Message::Write { filename, mode } => todo!(),
             Message::Data { block, payload } => {
-                (3 as u16).to_be_bytes().into_iter()
-                    .chain((block as u16).to_be_bytes().into_iter())
-                    .chain(payload.into_iter())
+                3_u16.to_be_bytes().into_iter()
+                    .chain(block.to_be_bytes())
+                    .chain(payload)
                     .collect()
             }
             // Message::AckMessage(_) => todo!(),
             Message::Error { code, message } => {
-                (5 as u16).to_be_bytes().into_iter()
-                    .chain((code as u16).to_be_bytes().into_iter())
-                    .chain(message.bytes().into_iter())
+                5_u16.to_be_bytes().into_iter()
+                    .chain((code as u16).to_be_bytes())
+                    .chain(message.bytes())
                     .chain([0])
                     .collect()
             }
@@ -139,13 +112,17 @@ impl Message {
 #[derive(Debug)]
 pub enum ParseError {
     CorruptPacket(String),
-    InvalidOpcode,
+    InvalidOpcode(u16),
     InvalidString(Vec<u8>),
 }
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        todo!()
+        match self {
+            ParseError::CorruptPacket(string) => write!(f, "Corrupt packet: {string}"),
+            ParseError::InvalidOpcode(opcode) => write!(f, "Invalid opcode: {opcode}"),
+            ParseError::InvalidString(stream) => write!(f, "Invalid string: {stream:?}"),
+        }
     }
 }
 
@@ -204,7 +181,7 @@ pub fn parse_message(buffer: &[u8]) -> Result<Message, ParseError> {
         3 => { todo!() },
         4 => Message::Ack(u16::from_be_bytes([buffer[2], buffer[3]])),
         5 => { todo!() },
-        _ => { return Err(ParseError::InvalidOpcode) }
+        code => { return Err(ParseError::InvalidOpcode(code)) }
     })
 }
 
