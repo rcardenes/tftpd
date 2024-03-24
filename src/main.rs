@@ -172,9 +172,16 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                    Message::Ack(block) => {
+                    msg => {
+                        if !sock.send_to(
+                            &ErrorCode::IllegalOperation
+                                .into_message()
+                                .into_packet(),
+                            addr).await.is_ok()
+                        {
+                            eprintln!("Error trying to answer to illegal message: {msg:?}");
+                        }
                     }
-                    _ => {}
                 }
             },
             Err(error) => {},
