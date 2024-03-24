@@ -184,5 +184,3 @@ pub fn parse_message(buffer: &[u8]) -> Result<Message, ParseError> {
         code => { return Err(ParseError::InvalidOpcode(code)) }
     })
 }
-
-

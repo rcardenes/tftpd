@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 use clap::{arg, command, value_parser};
 use tokio::{
@@ -74,6 +74,24 @@ async fn read_block(file: &mut File, block_size: usize) -> Result<Vec<u8>> {
     Ok(buffer[..len].to_vec())
 }
 
+enum Dest {
+    Fixed,
+    Addr(SocketAddr),
+}
+
+async fn send_error(sock: &UdpSocket, msg: Message, to: Dest) {
+    let packet = msg.into_packet();
+    let res = match to {
+        Dest::Fixed => sock.send(&packet).await,
+        Dest::Addr(addr) => sock.send_to(&packet, addr).await,
+    };
+
+    match res {
+        Err(error) => eprintln!("While trying to send an error message: {error:?}"),
+        _ => {}
+    }
+}
+
 async fn worker_task(sock: UdpSocket, mut file: File) {
     let block_size = BLOCK_SIZE;
     let tout = tokio::time::Duration::from_millis(DEFAULT_TIMEOUT);
@@ -85,7 +103,7 @@ async fn worker_task(sock: UdpSocket, mut file: File) {
         let payload = match read_block(&mut file, block_size).await {
             Ok(data) => data,
             Err(_) => {
-                sock.send(&ErrorCode::NotDefined.into_message().into_packet()).await;
+                send_error(&sock, ErrorCode::NotDefined.into_message(), Dest::Fixed).await;
                 break;
             }
         };
@@ -96,7 +114,10 @@ async fn worker_task(sock: UdpSocket, mut file: File) {
         let mut waiting_for_ack = false;
         while failed_attempts < MAX_ATTEMPTS {
             if !waiting_for_ack {
-                sock.send(&message).await;
+                if !sock.send(&message).await.is_ok() {
+                    // Abort, something really wrong happened here
+                    return;
+                }
                 waiting_for_ack = true;
             } else if timeout(tout, sock.recv(&mut read_buffer)).await.is_ok() {
                 if let Ok(message) = parse_message(&read_buffer) {
@@ -107,9 +128,11 @@ async fn worker_task(sock: UdpSocket, mut file: File) {
                             }
                         }
                         _ => {
-                            sock.send(&ErrorCode::IllegalOperation
-                                      .into_message()
-                                      .into_packet()).await;
+                            send_error(
+                                &sock,
+                                ErrorCode::IllegalOperation.into_message(),
+                                Dest::Fixed
+                                ).await;
                         }
                     };
                 }
@@ -152,11 +175,12 @@ async fn main() -> Result<()> {
                     }
                     Message::Read { filename, mode } => {
                         if mode != Mode::Octet {
-                            sock.send_to(
-                                &ErrorCode::IllegalOperation
-                                    .into_explicit_message("Only Octet transfers are supported")
-                                    .into_packet(),
-                                addr).await;
+                            send_error(
+                                &sock, 
+                                ErrorCode::IllegalOperation
+                                    .into_explicit_message("Only Octet transfers are supported"),
+                                Dest::Addr(addr),
+                                ).await
                         } else {
                             match open_file(&config, &filename).await {
                                 Ok(file) => {
@@ -167,7 +191,7 @@ async fn main() -> Result<()> {
                                     tokio::spawn(worker_task(sock, file));
                                 }
                                 Err(errmsg) => {
-                                    sock.send_to(&errmsg.into_packet(), addr).await;
+                                    send_error(&sock, errmsg, Dest::Addr(addr)).await;
                                 }
                             }
                         }
@@ -184,7 +208,9 @@ async fn main() -> Result<()> {
                     }
                 }
             },
-            Err(error) => {},
+            Err(error) => {
+                eprintln!("While parsing message: {error}");
+            },
         }
     }
 }
