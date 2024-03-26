@@ -52,6 +52,7 @@ pub enum ErrorCode {
     UnknownTransferId,
     FileAlreadyExists,
     NoSuchUser,
+    OptionNegotiationError,
 }
 
 impl ErrorCode {
@@ -66,6 +67,7 @@ impl ErrorCode {
                 ErrorCode::UnknownTransferId => "Unknown TID",
                 ErrorCode::FileAlreadyExists => "File already exists",
                 ErrorCode::NoSuchUser => "No such user",
+                ErrorCode::OptionNegotiationError => "Error during option negotiation",
             }.into(),
             code: self,
         }
@@ -78,14 +80,31 @@ impl ErrorCode {
 
 #[derive(Debug)]
 pub enum Message {
-    Read { filename: String, mode: Mode },
-    Write { filename: String, mode: Mode },
+    Read { filename: String, mode: Mode, options: Vec<TftpOption> },
+    Write { filename: String, mode: Mode, options: Vec<TftpOption> },
     Data { block: u16, payload: Vec<u8> },
     Ack(u16),
     Error { code: ErrorCode, message: String },
+    OptionAck { options: Vec<TftpOption> },
 }
 
 impl Message {
+    fn read_from_arguments(args: Arguments) -> Self {
+        Message::Read {
+            filename: args.filename,
+            mode: args.mode,
+            options: args.options,
+        }
+    }
+
+    fn write_from_arguments(args: Arguments) -> Self {
+        Message::Write {
+            filename: args.filename,
+            mode: args.mode,
+            options: args.options,
+        }
+    }
+
     pub fn into_packet(self) -> Vec<u8> {
         match self {
             // Message::Read { filename, mode } => todo!(),
@@ -104,6 +123,12 @@ impl Message {
                     .chain([0])
                     .collect()
             }
+            Message::OptionAck { options } => {
+                let encoded_options = options.iter().map(|op| op.encode());
+                6_u16.to_be_bytes().into_iter()
+                    .chain(encoded_options.flatten())
+                    .collect()
+            }
             _ => todo!()
         }
     }
@@ -113,7 +138,7 @@ impl Message {
 pub enum ParseError {
     CorruptPacket(String),
     InvalidOpcode(u16),
-    InvalidString(Vec<u8>),
+    InvalidString(String),
 }
 
 impl std::fmt::Display for ParseError {
@@ -129,37 +154,104 @@ impl std::fmt::Display for ParseError {
 impl std::error::Error for ParseError {
 }
 
-fn parse_readwrite(buffer: &[u8]) -> Result<(String, Mode), ParseError> {
+fn extract_strings(buffer: &[u8]) -> Vec<String> {
+    buffer
+        .split(|&c| c == 0)
+        .map(|chunk| String::from_utf8_lossy(chunk).to_string())
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub enum TftpOption {
+    BlockSize(u16),
+    Timeout(u8),
+    TransferSize(u64),
+}
+
+impl TftpOption {
+    fn name(&self) -> String {
+        match self {
+            TftpOption::BlockSize(..) => "blksize",
+            TftpOption::Timeout(..) => "timeout",
+            TftpOption::TransferSize(..) => "tsize",
+        }.into()
+    }
+
+    fn encoded_value(&self) -> Vec<u8> {
+        match self {
+            TftpOption::BlockSize(sz) => sz.to_string(),
+            TftpOption::Timeout(tout) => tout.to_string(),
+            TftpOption::TransferSize(tsize) => tsize.to_string(),
+        }.bytes().collect()
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        self.name()
+            .bytes()
+            .chain([0])
+            .chain(self.encoded_value().into_iter())
+            .chain([0])
+            .collect()
+    }
+}
+
+fn parse_option(name: &str, value: &str) -> Option<TftpOption> {
+    match name.to_lowercase().as_str() {
+        "blksize" => { // Following RFC 2348
+            value.parse::<u16>()
+                .ok()
+                .filter(|&val| (val > 7 && val < 65465))
+                .and_then(|val| Some(TftpOption::BlockSize(val)))
+        }
+        "timeout" => { // Following RFC 2349
+            value.parse::<u8>()
+                .ok()
+                .filter(|&val| val > 0)
+                .and_then(|val| Some(TftpOption::Timeout(val)))
+        }
+        "tsize" => {  // Following RFC 2394 - does not define upper limit
+            value.parse::<u64>()
+                .ok()
+                .and_then(|val| Some(TftpOption::TransferSize(val)))
+        }
+        _ => None,
+    }
+}
+
+struct Arguments {
+    filename: String,
+    mode: Mode,
+    options: Vec<TftpOption>,
+}
+
+fn parse_readwrite(buffer: &[u8]) -> Result<Arguments, ParseError> {
     if buffer.len() < 4 {
         return Err(ParseError::CorruptPacket("Too short packet".into()));
     }
 
-    if let Some(p1) = buffer.iter().position(|&b| b == 0) {
-        if let Some(p2) = buffer[(p1+1)..].iter().position(|&b| b == 0) {
-            let possible_filename = buffer[..p1].to_vec();
-            let filename = match String::from_utf8(possible_filename.clone()) {
-                Ok(name) => name,
-                Err(_) => return Err(ParseError::InvalidString(possible_filename)),
-            };
+    let strings = extract_strings(buffer);
 
-            let beg = p1 + 1;
-            let possible_mode = buffer[beg .. (beg + p2)].to_vec();
-            let mode = match String::from_utf8(possible_mode.clone()) {
-                Ok(name) => {
-                    match Mode::try_from(name.as_str()) {
-                        Ok(mode) => mode,
-                        Err(_) => return Err(ParseError::InvalidString(possible_mode)),
-                    }
-                },
-                Err(_) => return Err(ParseError::InvalidString(possible_mode)),
-            };
-
-            Ok((filename, mode))
-        } else {
-            Err(ParseError::CorruptPacket("Not terminated: mode".into()))
-        }
+    if strings.len() < 2 {
+        Err(ParseError::CorruptPacket("Missing arguments".into()))
     } else {
-        Err(ParseError::CorruptPacket("Not terminated: filename".into()))
+        let filename = strings[0].clone();
+        let possible_mode = &strings[1];
+        let mode = match Mode::try_from(possible_mode.as_str()) {
+            Ok(mode) => mode,
+            Err(_) => return Err(ParseError::InvalidString(possible_mode.into())),
+        };
+        let options = strings[2..]
+            .chunks(2)
+            .filter(|chunk| chunk.len() == 2) // To discard leftovers
+            .map(|chunk| parse_option(&chunk[0], &chunk[1]))
+            .flatten()
+            .collect::<Vec<_>>();
+
+        Ok(Arguments {
+            filename,
+            mode,
+            options,
+        })
     }
 }
 
@@ -170,17 +262,26 @@ pub fn parse_message(buffer: &[u8]) -> Result<Message, ParseError> {
 
     // Interpret the opcode
     Ok(match u16::from_be_bytes([buffer[0], buffer[1]]) {
-        1 => {
-            let (filename, mode) = parse_readwrite(&buffer[2..])?;
-            Message::Read { filename, mode }
-        },
-        2 => {
-            let (filename, mode) = parse_readwrite(&buffer[2..])?;
-            Message::Write { filename, mode }
-        },
+        1 => Message::read_from_arguments(parse_readwrite(&buffer[2..])?),
+        2 => Message::write_from_arguments(parse_readwrite(&buffer[2..])?),
         3 => { todo!() },
         4 => Message::Ack(u16::from_be_bytes([buffer[2], buffer[3]])),
         5 => { todo!() },
         code => { return Err(ParseError::InvalidOpcode(code)) }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Message, TftpOption};
+
+    #[test]
+    fn encode_oack() {
+        let options = vec![
+            TftpOption::BlockSize(1024),
+            TftpOption::TransferSize(100000000),
+        ];
+        let msg = Message::OptionAck { options };
+        eprintln!("{:?}", msg.into_packet());
+    }
 }

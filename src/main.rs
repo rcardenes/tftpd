@@ -4,11 +4,12 @@ use clap::{arg, command, value_parser};
 use tokio::{
     fs::{File, OpenOptions},
     io::AsyncReadExt,
-    net::UdpSocket, time::timeout
+    net::UdpSocket,
+    time::{Duration, timeout}
 };
-use anyhow::Result;
+use anyhow::{bail, Result};
 
-use tftpd::{parse_message, ErrorCode, Message, Mode};
+use tftpd::{parse_message, ErrorCode, Message, Mode, TftpOption};
 
 const DEFAULT_PORT: &str = "69";
 const DEFAULT_STATIC_ROOT: &str = "/srv/tftp/static";
@@ -92,12 +93,107 @@ async fn send_error(sock: &UdpSocket, msg: Message, to: Dest) {
     }
 }
 
-async fn worker_task(sock: UdpSocket, mut file: File) {
-    let block_size = BLOCK_SIZE;
-    let tout = tokio::time::Duration::from_millis(DEFAULT_TIMEOUT);
+fn get_block_size(options: &[TftpOption]) -> usize {
+    for opt in options {
+        match opt {
+            TftpOption::BlockSize(bls) => { return *bls as usize },
+            _ => {}
+        }
+    }
+
+    BLOCK_SIZE
+}
+
+fn get_timeout(options: &[TftpOption]) -> u64 {
+    for opt in options {
+        match opt {
+            TftpOption::Timeout(tout) => { return *tout as u64 },
+            _ => {}
+        }
+    }
+
+    DEFAULT_TIMEOUT
+}
+
+fn get_transfer_size(options: &[TftpOption]) -> Option<u64> {
+    for opt in options {
+        match opt {
+            TftpOption::TransferSize(tsize) => { return Some(*tsize) },
+            _ => {}
+        }
+    }
+
+    None
+}
+
+async fn packet_and_ack(sock: &UdpSocket, block: u16, packet: &Vec<u8>, block_size: usize, tout: Duration) -> Result<()> {
+    let mut read_buffer = vec![0; block_size];
+    let mut failed_attempts = 0;
+    let mut waiting_for_ack = false;
+    while failed_attempts < MAX_ATTEMPTS {
+        if !waiting_for_ack {
+            if !sock.send(&packet).await.is_ok() {
+                // Abort, something really wrong happened here
+                bail!("Critical error attemting to send packet");
+            }
+            waiting_for_ack = true;
+        } else if timeout(tout, sock.recv(&mut read_buffer)).await.is_ok() {
+            if let Ok(message) = parse_message(&read_buffer) {
+                match message {
+                    Message::Ack(block_id) => {
+                        if block_id == block {
+                            break;
+                        }
+                    }
+                    _ => {
+                        send_error(
+                            &sock,
+                            ErrorCode::IllegalOperation.into_message(),
+                            Dest::Fixed
+                            ).await;
+                    }
+                };
+            }
+        } else {
+            failed_attempts += 1;
+            eprintln!("Timeout (failed: {failed_attempts}/{MAX_ATTEMPTS})");
+            waiting_for_ack = false;
+        }
+    }
+
+    if failed_attempts >= MAX_ATTEMPTS {
+        bail!("Too many retries")
+    }
+
+    Ok(())
+}
+
+async fn worker_task(sock: UdpSocket, mut file: File, options: Vec<TftpOption>) {
+    let block_size = get_block_size(&options);
+    let tout = Duration::from_millis(get_timeout(&options));
+
+    if options.len() > 0 {
+        if let Some(tsize) = get_transfer_size(&options) {
+            let fsize = file.metadata().await.unwrap().len();
+
+            if tsize > fsize {
+                send_error(
+                    &sock,
+                    ErrorCode::OptionNegotiationError
+                        .into_explicit_message("File too large"),
+                    Dest::Fixed).await;
+                return;
+            }
+        }
+
+        let msg = Message::OptionAck { options }.into_packet();
+        match packet_and_ack(&sock, 0, &msg, block_size, tout).await {
+            Err(error) => eprintln!("{error}"),
+            _ => {}
+        }
+    }
 
     let mut current_block: u16 = 0;
-    let mut read_buffer = vec![0; block_size];
     loop {
         current_block += 1;
         let payload = match read_block(&mut file, block_size).await {
@@ -110,41 +206,10 @@ async fn worker_task(sock: UdpSocket, mut file: File) {
         let payload_len = payload.len();
 
         let message = Message::Data { block: current_block, payload }.into_packet();
-        let mut failed_attempts = 0;
-        let mut waiting_for_ack = false;
-        while failed_attempts < MAX_ATTEMPTS {
-            if !waiting_for_ack {
-                if !sock.send(&message).await.is_ok() {
-                    // Abort, something really wrong happened here
-                    return;
-                }
-                waiting_for_ack = true;
-            } else if timeout(tout, sock.recv(&mut read_buffer)).await.is_ok() {
-                if let Ok(message) = parse_message(&read_buffer) {
-                    match message {
-                        Message::Ack(block_id) => {
-                            if block_id == current_block {
-                                break;
-                            }
-                        }
-                        _ => {
-                            send_error(
-                                &sock,
-                                ErrorCode::IllegalOperation.into_message(),
-                                Dest::Fixed
-                                ).await;
-                        }
-                    };
-                }
-            } else {
-                failed_attempts += 1;
-                eprintln!("Timeout (failed: {failed_attempts}/{MAX_ATTEMPTS})");
-                waiting_for_ack = false;
-            }
-        }
 
-        if failed_attempts >= MAX_ATTEMPTS {
-            return;
+        match packet_and_ack(&sock, current_block, &message, block_size, tout).await {
+            Err(error) => eprintln!("{error}"),
+            _ => {}
         }
 
         if payload_len < block_size {
@@ -173,7 +238,7 @@ async fn main() -> Result<()> {
                                 .into_packet().as_ref(),
                             addr).await?;
                     }
-                    Message::Read { filename, mode } => {
+                    Message::Read { filename, mode, options } => {
                         if mode != Mode::Octet {
                             send_error(
                                 &sock, 
@@ -188,7 +253,7 @@ async fn main() -> Result<()> {
                                     let sock = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
                                     sock.connect(addr).await.unwrap();
 
-                                    tokio::spawn(worker_task(sock, file));
+                                    tokio::spawn(worker_task(sock, file, options));
                                 }
                                 Err(errmsg) => {
                                     send_error(&sock, errmsg, Dest::Addr(addr)).await;
